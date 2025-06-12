@@ -1,0 +1,6 @@
+numpy
+pyannote-audio
+# https://github.com/marianne-m/brouhaha-vad/archive/main.zip pip install this with --no-deps.
+pandas
+# Torch and Cuda is also required please find a compatible version through your own means.
+PyYAML

@@ -1,0 +1,50 @@
+TimeDomain:
+  SpeedPerturb:
+    orig_freq: 16000
+    speeds: [80]
+  #DropChunk:
+  #  drop_length_low: 100
+  #  drop_length_high: 3000
+  #  drop_count_low: 1
+  #  drop_count_high: 12
+  #  noise_factor: 1.0
+  #DropFreq:
+    #drop_freq_low: 
+    #drop_freq_high: 
+  #  drop_freq_count_low: 1
+  #  drop_freq_count_high: 10
+    #drop_freq_width:
+  #DoClip:
+  #  clip_low: 0.1
+  #  clip_high: 0.9
+  #RandAmp:
+  #  amp_low: 0.5
+  #  amp_high: 1.5
+  AddNoise:
+    csv_file: ./noise.csv
+    pad_noise: True
+    snr_low: 5
+    snr_high: 15
+  #AddReverb:
+  #  csv_file: ./noise.csv
+  #CutCat:
+  #  min_num_segments: 0
+  #  max_num_segments: 10
+  #DropBitResolution:
+  #  target_dtype: "random"
+  #SignFlip:
+  #  flip_prob: 0.5
+  # DOES NOT WORK, CAUSES ERROR, CANNOT BE RESOLVED YET.
+  #ChannelDrop: 
+  #  drop_rate: 0.2
+  #ChannelSwap:
+  #  min_swap: 0
+  #  max_swap: 4
+  
+Augmenter:
+  parallel_augment: True
+  concat_original: False # DO NOT TOUCH THIS
+  min_augmentations: 5
+  max_augmentations: 5
+  shuffle_augmentations: False
+  repeat_augment: 1

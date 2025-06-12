@@ -1,0 +1,39 @@
+# Create .gitignore
+cat > .gitignore << EOF
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Temp directories
+temp_noise_augment/
+
+# Large audio files (optional, remove if you want to include them)
+# *.wav
+# *.mp3
+
+# Project specific
+AUG_AUDIO/
+EOF

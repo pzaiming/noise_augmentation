@@ -1,0 +1,3 @@
+train_epochs: 100
+tune_epochs: 50
+batch_size: 64
