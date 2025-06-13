@@ -1,97 +1,114 @@
 import os
-import yaml
+import numpy as np
 import torch
-import argparse
-import speechbrain as sb
-import speechbrain.augment.time_domain as time_augmentations
-from speechbrain.augment.augmenter import Augmenter
-from speechbrain.dataio.dataio import read_audio, write_audio
-from utils import path_builder as pb, file_check, mk_dir, rm_ext
+import torchaudio
+import yaml
 from tqdm import tqdm
 
-class AugmentPipeline:
-    def __init__(self, AUD_PTH, CONF_PTH, OUT_PTH):
-        self.CWD = os.getcwd() # Instantiate current working directory.
-        self.AUD_PTH = pb(self.CWD, file_check(AUD_PTH))
-        self.CONF_PTH = pb(self.CWD, file_check(CONF_PTH))
-        self.OUT_PTH = pb(self.CWD, file_check(OUT_PTH))
+class AudioAugmenter:
+    def __init__(self, config_path):
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
         
-        augments, arg_list = self.instantiate_augments()
-        self.load_augmenter_class(augments)
-        self.augment_data(arg_list)
-
-    def instantiate_augments(self) -> list:
-        with open(self.CONF_PTH, "r") as config_file:
-            config_data = yaml.safe_load(config_file)
-        augments = []  # Store initialized augmentations here
-        self.AUG_CONF = None
-        arg_list = []
-        for key, value in config_data.items():
-            if key == "Augmenter":
-                self.AUG_CONF = value
-                continue
-            elif key == "TimeDomain":
-                for augment_name, args in value.items():
-                    arg_list.append(augment_name)
-                    try: # Dynamically get each augment and their arguments from the module
-                        augment_class = getattr(time_augmentations, augment_name)
-                    except AttributeError:
-                        raise ValueError(f"Augmentation {augment_name} not found in the module.")
-                    if isinstance(args, dict): # Initialize the augmentation with the arguments
-                        augments.append(augment_class(**args))
-                    else:
-                        raise ValueError(f"Invalid arguments for {augment_name}: {args}")
-        expected_config = {
-        "parallel_augment": True,
-        "concat_original": False,
-        "shuffle_augmentations": False
-        }
-        if "Augmenter" in config_data:
-            augmenter_config = config_data["Augmenter"]
-            is_match = all(
-                augmenter_config.get(key) == value for key, value in expected_config.items()
-            )
-            if is_match:
-                self.INDIVCHECK = True
-            else:
-                self.INDIVCHECK = False
+        # Load noise files
+        noise_csv = self.config['TimeDomain']['AddNoise']['csv_file']
+        self.load_noise_files(noise_csv)
+    
+    def load_noise_files(self, csv_path):
+        import csv
+        self.noise_files = []
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            self.noise_files = list(reader)
+    
+    def add_noise(self, audio_path, noise_path, snr):
+        """Simple noise addition that preserves original audio"""
+        # Load original audio
+        audio, sr = torchaudio.load(audio_path)
+        
+        # Load and prepare noise
+        noise, noise_sr = torchaudio.load(noise_path)
+        
+        # Resample noise if needed
+        if noise_sr != sr:
+            noise = torchaudio.transforms.Resample(noise_sr, sr)(noise)
+        
+        # Convert both to mono if needed
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+        if noise.shape[0] > 1:
+            noise = noise.mean(dim=0, keepdim=True)
+        
+        # Adjust noise length
+        if noise.shape[1] < audio.shape[1]:
+            # Repeat noise to match audio length
+            repeats = int(np.ceil(audio.shape[1] / noise.shape[1]))
+            noise = noise.repeat(1, repeats)[:, :audio.shape[1]]
         else:
-            raise ValueError("'Augmenter' section not found in the configuration file.")
-        return augments, arg_list
-
-    def load_augmenter_class(self, augment_lst):
-        if isinstance(self.AUG_CONF, dict):
-            self.AUG = Augmenter(**self.AUG_CONF, augmentations=augment_lst)
-        else:
-            raise ValueError(f"Invalid arguments for Augmenter: {self.AUG_CONF}")
-
-    def augment_data(self, arg_list):
-        for file in tqdm(os.listdir(self.AUD_PTH)):
-            signal = read_audio(f'{pb(self.AUD_PTH, file)}')
-            clean = signal.unsqueeze(0)
-            augmented_signal, lenghts = self.AUG(clean, lengths=torch.ones(1))
-
-            num_signals = augmented_signal.shape[0] # WARNING!!! Dependng on arguments passed, augmented_signal may be of a larger shape than 1.
-            if num_signals > 1:
-                idx = 0
-                for signal in augmented_signal:
-                    if self.INDIVCHECK:
-                        signal_dir = mk_dir(self.OUT_PTH, arg_list[idx])
-                    else:
-                        signal_dir = mk_dir(self.OUT_PTH, str(idx))
-                    write_audio(pb(signal_dir, f"{rm_ext(file)}_AUG.wav"), signal, samplerate=16000)
-                    idx += 1
-            else:
-                write_audio(pb(self.OUT_PTH, f"{rm_ext(file)}_AUG.wav"), augmented_signal[0], samplerate=16000)
-
+            # Trim noise to match audio length
+            noise = noise[:, :audio.shape[1]]
+        
+        # Calculate mixing ratio based on SNR
+        audio_power = audio.pow(2).mean()
+        noise_power = noise.pow(2).mean()
+        
+        # Convert SNR to scaling factor
+        scaling = torch.sqrt(audio_power / (noise_power * (10 ** (snr/10))))
+        
+        # Mix audio with noise
+        noisy_audio = audio + (noise * scaling)
+        
+        # Normalize if needed
+        max_val = torch.abs(noisy_audio).max()
+        if max_val > 1.0:
+            noisy_audio = noisy_audio / max_val * 0.9
+        
+        return noisy_audio, sr
+    
+    def process_file(self, input_path, output_path):
+        try:
+            # Select random noise file
+            noise_file = np.random.choice(self.noise_files)
+            noise_path = noise_file['wav']
+            
+            # Get SNR from config
+            noise_config = self.config['TimeDomain']['AddNoise']
+            snr = np.random.uniform(noise_config['snr_low'], noise_config['snr_high'])
+            
+            # Add noise
+            augmented, sr = self.add_noise(input_path, noise_path, snr)
+            
+            # Save with same parameters as input
+            torchaudio.save(output_path, augmented, sr)
+            return True
+        
+        except Exception as e:
+            print(f"Error processing {input_path}: {e}")
+            return False
 
 def main():
+    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("-AUD_PTH", help="Path to a directory containing audio files to be augmented.", required=True)
-    parser.add_argument("-CONF_PTH", help="Path to a config file that contains all the arguments required for each augmentation.", required=True)
-    parser.add_argument("-OUT_PTH", help="Path to an output directory.", required=True)
+    parser.add_argument("-AUD_PTH", required=True)
+    parser.add_argument("-CONF_PTH", required=True)
+    parser.add_argument("-OUT_PTH", required=True)
     args = parser.parse_args()
-    AugmentPipeline(args.AUD_PTH, args.CONF_PTH, args.OUT_PTH)
+    
+    # Create output directory
+    os.makedirs(args.OUT_PTH, exist_ok=True)
+    
+    # Initialize augmenter
+    augmenter = AudioAugmenter(args.CONF_PTH)
+    
+    # Get audio files
+    audio_files = [f for f in os.listdir(args.AUD_PTH) 
+                   if f.endswith(('.wav', '.mp3', '.flac'))]
+    
+    # Process files
+    for file in tqdm(audio_files):
+        input_path = os.path.join(args.AUD_PTH, file)
+        output_path = os.path.join(args.OUT_PTH, f"aug_{file}")
+        augmenter.process_file(input_path, output_path)
 
 if __name__ == "__main__":
-    main()  
+    main()

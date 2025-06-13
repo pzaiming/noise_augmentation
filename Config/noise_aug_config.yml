@@ -1,0 +1,14 @@
+TimeDomain:
+  AddNoise:
+    csv_file: ./Extracted_Noise/noise.csv
+    pad_noise: True
+    snr_low: 10    # Adjust these values to control noise level
+    snr_high: 20   # Higher = more subtle noise
+
+Augmenter:
+  parallel_augment: True
+  concat_original: False
+  min_augmentations: 1
+  max_augmentations: 1
+  shuffle_augmentations: False
+  repeat_augment: 1

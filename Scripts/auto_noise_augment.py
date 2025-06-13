@@ -76,9 +76,16 @@ def generate_noise_csv(noise_dir, csv_path):
     print(f"Created noise CSV at {csv_path}")
     return True
 
-def auto_noise_augment(noise_source_path, target_audio_path, output_path, config_template_path=None):
+def auto_noise_augment(noise_source_path, target_audio_path, output_path, config_template_path=None, use_vad=True):
     """
     Automated pipeline to extract noise from one audio source and use it to augment target audio
+    
+    Args:
+        noise_source_path: Path to audio file(s) to extract noise from
+        target_audio_path: Path to audio file(s) to augment with extracted noise
+        output_path: Path for output files
+        config_template_path: Path to a config template (optional)
+        use_vad: Whether to use VAD-based noise extraction (True) or simple extraction (False)
     """
     # Get the Python interpreter path that was used to run this script
     python_path = sys.executable
@@ -98,23 +105,39 @@ def auto_noise_augment(noise_source_path, target_audio_path, output_path, config
     
     # Step 1: Extract noise from source audio to Extracted_Noise
     print("\n--- Step 1: Extracting noise from source audio ---")
-    extract_cmd = [python_path, "Scripts/noise.py", 
-                  "-AUD_PTH", noise_source_path, 
-                  "-OUT_PTH", extracted_noise_dir]
+    
+    if use_vad:
+        # Use Silero VAD-based noise extraction
+        extract_cmd = [python_path, "Scripts/silero_vad_extractor.py", 
+                      "-AUD_PTH", noise_source_path, 
+                      "-OUT_PTH", extracted_noise_dir]
+    else:
+        # Use traditional noise extraction
+        extract_cmd = [python_path, "Scripts/noise.py", 
+                      "-AUD_PTH", noise_source_path, 
+                      "-OUT_PTH", extracted_noise_dir]
+    
     if not run_command(extract_cmd):
         print("Error extracting noise. Exiting.")
         return False
     
-    # Step 2: Create noise.csv and config file
-    print("\n--- Step 2: Creating augmentation configuration ---")
-    if generate_noise_csv(extracted_noise_dir, noise_csv_path):
-        # Create a default config for noise augmentation or use template
-        if config_template_path and os.path.exists(config_template_path):
-            shutil.copy(config_template_path, config_path)
-            print(f"Using config template from {config_template_path}")
-        else:
-            with open(config_path, "w") as f:
-                f.write(f"""TimeDomain:
+    # Use the noise.csv file created by the extractor
+    if os.path.exists(os.path.join(extracted_noise_dir, "noise.csv")):
+        shutil.copy(os.path.join(extracted_noise_dir, "noise.csv"), noise_csv_path)
+    else:
+        # Step 2: Create noise.csv and config file
+        print("\n--- Step 2: Creating augmentation configuration ---")
+        if not generate_noise_csv(os.path.join(extracted_noise_dir, "Noise"), noise_csv_path):
+            print("Error: Could not create noise CSV")
+            return False
+    
+    # Create config file
+    if config_template_path and os.path.exists(config_template_path):
+        shutil.copy(config_template_path, config_path)
+        print(f"Using config template from {config_template_path}")
+    else:
+        with open(config_path, "w") as f:
+            f.write(f"""TimeDomain:
   AddNoise:
     csv_file: {noise_csv_path}
     pad_noise: True
@@ -129,10 +152,7 @@ Augmenter:
   shuffle_augmentations: False
   repeat_augment: 1
 """)
-            print(f"Created default config at {config_path}")
-    else:
-        print("Error: Could not create noise CSV")
-        return False
+        print(f"Created default config at {config_path}")
     
     # Step 3: Run augmentation using noise from Extracted_Noise
     print("\n--- Step 3: Applying noise augmentation to target audio ---")
@@ -160,9 +180,10 @@ def main():
     parser.add_argument("-TARGET", help="Path to audio file(s) to augment with the extracted noise", required=True)
     parser.add_argument("-OUT_PTH", help="Path for output files", required=True)
     parser.add_argument("-CONF_TPL", help="Path to a config template (optional)")
+    parser.add_argument("--use-vad", action="store_true", help="Use VAD-based noise extraction")
     args = parser.parse_args()
     
-    auto_noise_augment(args.NOISE_SRC, args.TARGET, args.OUT_PTH, args.CONF_TPL)
+    auto_noise_augment(args.NOISE_SRC, args.TARGET, args.OUT_PTH, args.CONF_TPL, args.use_vad)
 
 if __name__ == "__main__":
     main()
