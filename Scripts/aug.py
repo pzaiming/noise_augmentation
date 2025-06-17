@@ -83,7 +83,7 @@ class AudioAugmenter:
         return librosa.istft(noise_extended, length=len(audio))
 
     def add_noise(self, audio, sr):
-        """Add multiple noise segments with different profiles"""
+        """Add multiple noise segments with smooth transitions"""
         try:
             # Convert audio length from samples to seconds
             audio_length = audio.shape[1] / sr
@@ -91,14 +91,23 @@ class AudioAugmenter:
             # Get dynamic segments for this audio length
             segments = get_dynamic_noise_segments(audio_length)
             
-            # Initialize output tensor
+            # Initialize output tensor with original audio
             mixed = audio.clone()
+            noise_layer = torch.zeros_like(audio)
             
-            # Apply different noise to each segment
-            for start_sec, end_sec in segments:
+            # Overlap parameters
+            overlap_time = 0.2  # 200ms overlap
+            overlap_samples = int(overlap_time * sr)
+            
+            # Process each segment with overlapping
+            for i, (start_sec, end_sec) in enumerate(segments):
                 # Convert time to samples
                 start_sample = int(start_sec * sr)
                 end_sample = int(end_sec * sr)
+                
+                # Extend segment boundaries for overlap
+                overlap_start = max(0, start_sample - overlap_samples)
+                overlap_end = min(audio.shape[1], end_sample + overlap_samples)
                 
                 # Select random noise file and SNR for this segment
                 noise_file = np.random.choice(self.noise_files)
@@ -107,49 +116,46 @@ class AudioAugmenter:
                 # Load and prepare noise
                 noise, noise_sr = torchaudio.load(noise_file['wav'])
                 
-                # Extract audio segment
-                segment = audio[:, start_sample:end_sample]
-                
-                # Match noise length to segment length
-                if noise.shape[1] < segment.shape[1]:
-                    repeats = int(np.ceil(segment.shape[1] / noise.shape[1]))
-                    noise = noise.repeat(1, repeats)[:, :segment.shape[1]]
+                # Match noise length to extended segment length
+                segment_length = overlap_end - overlap_start
+                if noise.shape[1] < segment_length:
+                    repeats = int(np.ceil(segment_length / noise.shape[1]))
+                    noise = noise.repeat(1, repeats)[:, :segment_length]
                 else:
-                    noise = noise[:, :segment.shape[1]]
-
-                # Normalize both signals
-                segment = segment / (torch.max(torch.abs(segment)) + 1e-8)
+                    noise = noise[:, :segment_length]
+                
+                # Normalize noise
                 noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
                 
-                # Calculate noise scale
+                # Create segment envelope for smooth transitions
+                envelope = torch.ones(segment_length)
+                
+                # Apply fade in
+                if overlap_start > 0:
+                    fade_in = torch.cos(torch.linspace(math.pi, 2*math.pi, overlap_samples)) * 0.5 + 0.5
+                    envelope[:overlap_samples] = fade_in
+                
+                # Apply fade out
+                if overlap_end < audio.shape[1]:
+                    fade_out = torch.cos(torch.linspace(0, math.pi, overlap_samples)) * 0.5 + 0.5
+                    envelope[-overlap_samples:] = fade_out
+            
+                # Calculate noise scale with randomization
                 snr = -abs(snr)  # Make SNR negative for more prominent noise
                 noise_scale = 10 ** (snr / 20.0)
                 noise_scale = max(noise_scale, 0.3)  # Minimum noise level
                 
-                # Apply noise to segment
-                mixed_segment = segment + (noise * noise_scale)
-                
-                # Normalize segment
-                mixed_segment = mixed_segment / (torch.max(torch.abs(mixed_segment)) + 1e-8)
-                
-                # Apply crossfade at segment boundaries
-                fade_samples = int(0.05 * sr)  # 50ms crossfade
-                if start_sample > 0:
-                    # Fade in
-                    fade_in = torch.linspace(0, 1, fade_samples)
-                    mixed_segment[:, :fade_samples] *= fade_in
-                    mixed[:, start_sample:start_sample+fade_samples] *= (1 - fade_in)
-                
-                if end_sample < audio.shape[1]:
-                    # Fade out
-                    fade_out = torch.linspace(1, 0, fade_samples)
-                    mixed_segment[:, -fade_samples:] *= fade_out
-                    mixed[:, end_sample-fade_samples:end_sample] *= (1 - fade_out)
-                
-                # Insert mixed segment into output
-                mixed[:, start_sample:end_sample] = mixed_segment
+                # Apply envelope and add to noise layer
+                shaped_noise = noise * envelope.unsqueeze(0)
+                noise_layer[:, overlap_start:overlap_end] += shaped_noise * noise_scale
                 
                 print(f"Applied noise from {noise_file['wav']} at {start_sec:.1f}-{end_sec:.1f}s with SNR {snr:.1f}dB")
+        
+            # Normalize noise layer
+            noise_layer = noise_layer / (torch.max(torch.abs(noise_layer)) + 1e-8)
+            
+            # Mix original audio with noise layer
+            mixed = mixed + (noise_layer * 0.7)  # Adjust mixing ratio as needed
             
             # Final normalization
             mixed = mixed / (torch.max(torch.abs(mixed)) + 1e-8) * 0.95
@@ -176,36 +182,37 @@ class AudioAugmenter:
             print(f"\nError processing {input_path}: {e}")
             return False
 
-def get_dynamic_noise_segments(audio_length, min_noise_len=1.0, max_noise_len=2.0):
+def get_dynamic_noise_segments(audio_length):
     """
-    Calculate dynamic noise segment positions based on audio length
+    Calculate noise segments based on audio length:
+    - For clips <= 5s: single noise
+    - For clips > 5s: 2-3 segments
     
     Parameters:
     - audio_length: Length of the audio in seconds
-    - min_noise_len: Minimum length of a noise segment (default 1.0s)
-    - max_noise_len: Maximum length of a noise segment (default 2.0s)
     
     Returns: List of (start_time, end_time) tuples
     """
     segments = []
     
-    # Calculate number of segments based on audio length
-    # Longer audio gets more segments
-    num_segments = max(2, math.ceil(audio_length / 3))
+    # For very short clips (<= 5s), use single noise
+    if audio_length <= 5.0:
+        segments.append((0.0, audio_length))
+        return segments
     
-    # Dynamic noise length based on audio length
-    # Longer audio gets longer noise segments, up to max_noise_len
-    noise_length = min(max_noise_len, 
-                      max(min_noise_len, audio_length / (num_segments * 1.5)))
+    # For longer clips, use 2-3 segments
+    num_segments = np.random.randint(2, 4)  # 2 or 3 segments
     
-    # Calculate spacing between segments
-    available_space = audio_length - (noise_length * num_segments)
-    gap = available_space / (num_segments + 1)
+    # Create random split points
+    split_points = [0.0]  # Start point
+    random_splits = sorted(np.random.uniform(0.2, 0.8, num_segments-1))
+    split_points.extend(random_splits)
+    split_points.append(1.0)  # End point
     
-    # Create segments with even spacing
-    for i in range(num_segments):
-        start = (gap * (i + 1)) + (noise_length * i)
-        end = start + noise_length
+    # Convert split points to actual time segments
+    for i in range(len(split_points)-1):
+        start = split_points[i] * audio_length
+        end = split_points[i+1] * audio_length
         segments.append((start, end))
     
     return segments
