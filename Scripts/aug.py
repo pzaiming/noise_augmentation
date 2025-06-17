@@ -15,9 +15,10 @@ class AudioAugmenter:
         # Load noise configuration
         noise_config = self.config['TimeDomain']['AddNoise']
         self.noise_csv = noise_config['csv_file']
-        self.snr_low = noise_config.get('snr_low', 0)  # More aggressive noise
+        self.snr_low = noise_config.get('snr_low', 0)
         self.snr_high = noise_config.get('snr_high', 10)
-        
+        self.noise_method = noise_config.get('noise_method', 'crossfade')  # Default to crossfade
+    
         # Load noise files
         self.noise_files = []
         self.load_noise_files()
@@ -34,90 +35,119 @@ class AudioAugmenter:
 
     def apply_repeat_synthesis(self, audio, noise, sr):
         """Simple repetition-based synthesis"""
-        if len(noise) < len(audio):
-            repeats = int(np.ceil(len(audio) / len(noise)))
-            noise = np.tile(noise, repeats)[:len(audio)]
+        # Convert to numpy for easier manipulation
+        if torch.is_tensor(noise):
+            noise = noise.numpy()[0]
+        if torch.is_tensor(audio):
+            audio_length = audio.shape[1]
         else:
-            noise = noise[:len(audio)]
-        return noise
+            audio_length = len(audio)
+        
+        # Repeat noise to match audio length
+        if len(noise) < audio_length:
+            repeats = int(np.ceil(audio_length / len(noise)))
+            noise = np.tile(noise, repeats)[:audio_length]
+        else:
+            noise = noise[:audio_length]
+        
+        # Convert back to torch tensor
+        return torch.from_numpy(noise).unsqueeze(0)
 
     def apply_crossfade_synthesis(self, audio, noise, sr):
-        """Crossfade-based synthesis"""
-        fade_duration = int(0.1 * sr)
-        output = np.zeros(len(audio))
-        noise_pos = 0
+        """Crossfade-based synthesis with smooth transitions"""
+        # Get audio length and ensure noise matches
+        audio_length = audio.shape[1]
+        if noise.shape[1] != audio_length:
+            if noise.shape[1] < audio_length:
+                noise = noise.repeat(1, int(np.ceil(audio_length / noise.shape[1])))
+            noise = noise[:, :audio_length]
+    
+        # Overlap parameters
+        fade_duration = int(0.2 * sr)  # 200ms crossfade
         
-        while noise_pos < len(audio):
-            chunk_size = min(len(noise), len(audio) - noise_pos)
-            noise_chunk = noise[:chunk_size]
-            
-            if noise_pos > 0:
-                fade_in = np.linspace(0, 1, fade_duration)
-                fade_out = np.linspace(1, 0, fade_duration)
-                
-                output[noise_pos:noise_pos+fade_duration] *= fade_out
-                noise_chunk[:fade_duration] *= fade_in
-            
-            output[noise_pos:noise_pos+chunk_size] += noise_chunk
-            noise_pos += chunk_size - fade_duration
+        # Create segment envelope for smooth transitions
+        envelope = torch.ones(audio_length)
         
-        return output
+        # Apply fade in
+        fade_in = torch.cos(torch.linspace(math.pi, 2*math.pi, fade_duration)) * 0.5 + 0.5
+        envelope[:fade_duration] = fade_in
+        
+        # Apply fade out
+        fade_out = torch.cos(torch.linspace(0, math.pi, fade_duration)) * 0.5 + 0.5
+        envelope[-fade_duration:] = fade_out
+        
+        # Apply envelope to noise
+        shaped_noise = noise * envelope.unsqueeze(0)
+    
+        return shaped_noise
 
-    def apply_spectral_synthesis(self, audio, noise, sr):
-        """Spectral domain synthesis"""
+    def apply_spectral_synthesis(self, speech, noise, sr, snr):
+        """
+        Blend speech and noise in spectral domain
+        
+        Args:
+            speech: Speech waveform
+            noise: Noise waveform
+            sr: Sample rate
+            snr: Signal-to-noise ratio in dB
+        """
+        # STFT parameters
         n_fft = 2048
-        noise_stft = librosa.stft(noise, n_fft=n_fft)
+        hop_length = n_fft // 4
+        win_length = n_fft
+        
+        # Convert to spectrograms
+        speech_stft = librosa.stft(speech, n_fft=n_fft, 
+                                  hop_length=hop_length,
+                                  win_length=win_length)
+        noise_stft = librosa.stft(noise, n_fft=n_fft,
+                                 hop_length=hop_length,
+                                 win_length=win_length)
+        
+        # Get magnitudes and phases
+        speech_mag = np.abs(speech_stft)
+        speech_phase = np.angle(speech_stft)
         noise_mag = np.abs(noise_stft)
+        noise_phase = np.angle(noise_stft)
         
-        # Create extended noise in TF domain
-        n_frames = int(np.ceil(len(audio) / (n_fft/4)))
-        noise_extended = np.zeros((n_fft//2 + 1, n_frames), dtype=np.complex128)
+        # Calculate noise scale based on SNR
+        speech_power = np.mean(speech_mag ** 2)
+        noise_power = np.mean(noise_mag ** 2)
+        noise_scale = np.sqrt(speech_power / (noise_power * 10 ** (snr / 10)))
         
-        for f in range(noise_mag.shape[0]):
-            pattern = noise_mag[f, :]
-            repeats = int(np.ceil(n_frames / len(pattern)))
-            extended = np.tile(pattern, repeats)[:n_frames]
-            phase = np.random.uniform(-np.pi, np.pi, n_frames)
-            noise_extended[f, :] = extended * np.exp(1j * phase)
+        # Blend magnitudes
+        mixed_mag = speech_mag + (noise_mag * noise_scale)
         
-        return librosa.istft(noise_extended, length=len(audio))
+        # Combine with original speech phase
+        mixed_stft = mixed_mag * np.exp(1j * speech_phase)
+        
+        # Convert back to time domain
+        mixed = librosa.istft(mixed_stft, hop_length=hop_length, win_length=win_length)
+        
+        return mixed
 
     def add_noise(self, audio, sr):
-        """Add multiple noise segments with smooth transitions"""
+        """Add multiple noise segments using specified synthesis method"""
         try:
-            # Convert audio length from samples to seconds
             audio_length = audio.shape[1] / sr
-            
-            # Get dynamic segments for this audio length
             segments = get_dynamic_noise_segments(audio_length)
-            
-            # Initialize output tensor with original audio
             mixed = audio.clone()
             noise_layer = torch.zeros_like(audio)
+            noise_summary = []
             
-            # Overlap parameters
-            overlap_time = 0.2  # 200ms overlap
-            overlap_samples = int(overlap_time * sr)
-            
-            # Process each segment with overlapping
             for i, (start_sec, end_sec) in enumerate(segments):
-                # Convert time to samples
                 start_sample = int(start_sec * sr)
                 end_sample = int(end_sec * sr)
                 
-                # Extend segment boundaries for overlap
-                overlap_start = max(0, start_sample - overlap_samples)
-                overlap_end = min(audio.shape[1], end_sample + overlap_samples)
-                
-                # Select random noise file and SNR for this segment
+                # Select random noise file and SNR
                 noise_file = np.random.choice(self.noise_files)
                 snr = np.random.uniform(self.snr_low, self.snr_high)
                 
                 # Load and prepare noise
                 noise, noise_sr = torchaudio.load(noise_file['wav'])
+                segment_length = end_sample - start_sample
                 
-                # Match noise length to extended segment length
-                segment_length = overlap_end - overlap_start
+                # Match noise length to segment
                 if noise.shape[1] < segment_length:
                     repeats = int(np.ceil(segment_length / noise.shape[1]))
                     noise = noise.repeat(1, repeats)[:, :segment_length]
@@ -127,55 +157,74 @@ class AudioAugmenter:
                 # Normalize noise
                 noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
                 
-                # Create segment envelope for smooth transitions
-                envelope = torch.ones(segment_length)
+                # Apply selected synthesis method
+                if self.noise_method == "repeat":
+                    shaped_noise = self.apply_repeat_synthesis(audio[:, start_sample:end_sample], 
+                                                             noise, sr)
+                elif self.noise_method == "spectral":
+                    shaped_noise = self.apply_spectral_synthesis(audio[:, start_sample:end_sample].numpy()[0], 
+                                                               noise.numpy()[0], sr, snr)
+                    shaped_noise = torch.from_numpy(shaped_noise).unsqueeze(0)
+                else:  # default to crossfade
+                    shaped_noise = self.apply_crossfade_synthesis(audio[:, start_sample:end_sample], 
+                                                                noise, sr)
                 
-                # Apply fade in
-                if overlap_start > 0:
-                    fade_in = torch.cos(torch.linspace(math.pi, 2*math.pi, overlap_samples)) * 0.5 + 0.5
-                    envelope[:overlap_samples] = fade_in
+                # Calculate noise scale (except for spectral which handles SNR internally)
+                if self.noise_method != "spectral":
+                    snr = -abs(snr)
+                    noise_scale = 10 ** (snr / 20.0)
+                    noise_scale = max(noise_scale, 0.3)
+                    shaped_noise = shaped_noise * noise_scale
                 
-                # Apply fade out
-                if overlap_end < audio.shape[1]:
-                    fade_out = torch.cos(torch.linspace(0, math.pi, overlap_samples)) * 0.5 + 0.5
-                    envelope[-overlap_samples:] = fade_out
+                # Add shaped noise to noise layer
+                noise_layer[:, start_sample:end_sample] += shaped_noise
             
-                # Calculate noise scale with randomization
-                snr = -abs(snr)  # Make SNR negative for more prominent noise
-                noise_scale = 10 ** (snr / 20.0)
-                noise_scale = max(noise_scale, 0.3)  # Minimum noise level
-                
-                # Apply envelope and add to noise layer
-                shaped_noise = noise * envelope.unsqueeze(0)
-                noise_layer[:, overlap_start:overlap_end] += shaped_noise * noise_scale
-                
-                print(f"Applied noise from {noise_file['wav']} at {start_sec:.1f}-{end_sec:.1f}s with SNR {snr:.1f}dB")
-        
-            # Normalize noise layer
+                # Store noise info
+                noise_summary.append({
+                    'segment': i + 1,
+                    'noise_file': os.path.basename(noise_file['wav']),
+                    'start': f"{start_sec:.1f}s",
+                    'end': f"{end_sec:.1f}s",
+                    'duration': f"{end_sec - start_sec:.1f}s",
+                    'snr': f"{snr:.1f}dB",
+                    'method': self.noise_method
+                })
+            
+            # Normalize and mix
             noise_layer = noise_layer / (torch.max(torch.abs(noise_layer)) + 1e-8)
-            
-            # Mix original audio with noise layer
-            mixed = mixed + (noise_layer * 0.7)  # Adjust mixing ratio as needed
-            
-            # Final normalization
+            mixed = mixed + (noise_layer * 0.7)
             mixed = mixed / (torch.max(torch.abs(mixed)) + 1e-8) * 0.95
             
+            # Print summary
+            print("\nNoise segments used:")
+            for segment in noise_summary:
+                print(f"Segment {segment['segment']}: {segment['noise_file']}")
+                print(f"  Duration: {segment['duration']} ({segment['start']} - {segment['end']})")
+                print(f"  SNR: {segment['snr']}")
+                print(f"  Method: {segment['method']}")
+        
             return mixed
-            
+        
         except Exception as e:
             print(f"Error adding noise: {str(e)}")
             return audio
 
     def process_file(self, input_path, output_path):
         try:
+            print(f"\nProcessing: {os.path.basename(input_path)}")
+            print("-" * 50)
+            
             # Load audio
             audio, sr = torchaudio.load(input_path)
+            audio_length = audio.shape[1] / sr
+            print(f"Audio length: {audio_length:.2f}s")
             
             # Apply noise augmentation with multiple profiles
             augmented = self.add_noise(audio, sr)
             
             # Save augmented audio
             torchaudio.save(output_path, augmented, sr)
+            print("-" * 50)
             return True
             
         except Exception as e:
