@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torchaudio
 import yaml
+import csv
 from tqdm import tqdm
 
 class AudioAugmenter:
@@ -10,80 +11,141 @@ class AudioAugmenter:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         
+        # Load noise configuration
+        noise_config = self.config['TimeDomain']['AddNoise']
+        self.noise_csv = noise_config['csv_file']
+        self.snr_low = noise_config.get('snr_low', 0)  # More aggressive noise
+        self.snr_high = noise_config.get('snr_high', 10)
+        
         # Load noise files
-        noise_csv = self.config['TimeDomain']['AddNoise']['csv_file']
-        self.load_noise_files(noise_csv)
-    
-    def load_noise_files(self, csv_path):
-        import csv
         self.noise_files = []
-        with open(csv_path, 'r') as f:
-            reader = csv.DictReader(f)
-            self.noise_files = list(reader)
-    
-    def add_noise(self, audio_path, noise_path, snr):
-        """Simple noise addition that preserves original audio"""
-        # Load original audio
-        audio, sr = torchaudio.load(audio_path)
-        
-        # Load and prepare noise
-        noise, noise_sr = torchaudio.load(noise_path)
-        
-        # Resample noise if needed
-        if noise_sr != sr:
-            noise = torchaudio.transforms.Resample(noise_sr, sr)(noise)
-        
-        # Convert both to mono if needed
-        if audio.shape[0] > 1:
-            audio = audio.mean(dim=0, keepdim=True)
-        if noise.shape[0] > 1:
-            noise = noise.mean(dim=0, keepdim=True)
-        
-        # Adjust noise length
-        if noise.shape[1] < audio.shape[1]:
-            # Repeat noise to match audio length
-            repeats = int(np.ceil(audio.shape[1] / noise.shape[1]))
-            noise = noise.repeat(1, repeats)[:, :audio.shape[1]]
+        self.load_noise_files()
+
+    def load_noise_files(self):
+        try:
+            with open(self.noise_csv, 'r') as f:
+                reader = csv.DictReader(f)
+                self.noise_files = list(reader)
+            print(f"Loaded {len(self.noise_files)} noise files from {self.noise_csv}")
+        except Exception as e:
+            print(f"Error loading noise files: {e}")
+            raise
+
+    def apply_repeat_synthesis(self, audio, noise, sr):
+        """Simple repetition-based synthesis"""
+        if len(noise) < len(audio):
+            repeats = int(np.ceil(len(audio) / len(noise)))
+            noise = np.tile(noise, repeats)[:len(audio)]
         else:
-            # Trim noise to match audio length
-            noise = noise[:, :audio.shape[1]]
+            noise = noise[:len(audio)]
+        return noise
+
+    def apply_crossfade_synthesis(self, audio, noise, sr):
+        """Crossfade-based synthesis"""
+        fade_duration = int(0.1 * sr)
+        output = np.zeros(len(audio))
+        noise_pos = 0
         
-        # Calculate mixing ratio based on SNR
-        audio_power = audio.pow(2).mean()
-        noise_power = noise.pow(2).mean()
+        while noise_pos < len(audio):
+            chunk_size = min(len(noise), len(audio) - noise_pos)
+            noise_chunk = noise[:chunk_size]
+            
+            if noise_pos > 0:
+                fade_in = np.linspace(0, 1, fade_duration)
+                fade_out = np.linspace(1, 0, fade_duration)
+                
+                output[noise_pos:noise_pos+fade_duration] *= fade_out
+                noise_chunk[:fade_duration] *= fade_in
+            
+            output[noise_pos:noise_pos+chunk_size] += noise_chunk
+            noise_pos += chunk_size - fade_duration
         
-        # Convert SNR to scaling factor
-        scaling = torch.sqrt(audio_power / (noise_power * (10 ** (snr/10))))
+        return output
+
+    def apply_spectral_synthesis(self, audio, noise, sr):
+        """Spectral domain synthesis"""
+        n_fft = 2048
+        noise_stft = librosa.stft(noise, n_fft=n_fft)
+        noise_mag = np.abs(noise_stft)
         
-        # Mix audio with noise
-        noisy_audio = audio + (noise * scaling)
+        # Create extended noise in TF domain
+        n_frames = int(np.ceil(len(audio) / (n_fft/4)))
+        noise_extended = np.zeros((n_fft//2 + 1, n_frames), dtype=np.complex128)
         
-        # Normalize if needed
-        max_val = torch.abs(noisy_audio).max()
-        if max_val > 1.0:
-            noisy_audio = noisy_audio / max_val * 0.9
+        for f in range(noise_mag.shape[0]):
+            pattern = noise_mag[f, :]
+            repeats = int(np.ceil(n_frames / len(pattern)))
+            extended = np.tile(pattern, repeats)[:n_frames]
+            phase = np.random.uniform(-np.pi, np.pi, n_frames)
+            noise_extended[f, :] = extended * np.exp(1j * phase)
         
-        return noisy_audio, sr
-    
+        return librosa.istft(noise_extended, length=len(audio))
+
+    def add_noise(self, audio, noise_file, snr):
+        """Add noise with guaranteed audibility"""
+        try:
+            # Load and prepare noise
+            noise, noise_sr = torchaudio.load(noise_file['wav'])
+            
+            # Print debug info
+            print(f"\nNoise file: {noise_file['wav']}")
+            print(f"Noise range: {torch.min(noise).item():.3f} to {torch.max(noise).item():.3f}")
+            print(f"Audio range: {torch.min(audio).item():.3f} to {torch.max(audio).item():.3f}")
+            
+            # Match lengths
+            if noise.shape[1] < audio.shape[1]:
+                repeats = int(np.ceil(audio.shape[1] / noise.shape[1]))
+                noise = noise.repeat(1, repeats)[:, :audio.shape[1]]
+            else:
+                noise = noise[:, :audio.shape[1]]
+
+            # Normalize both signals to peak amplitude 1
+            audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
+            noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
+            
+            # Calculate noise scale based on desired SNR
+            # Using negative SNR for more prominent noise
+            snr = -abs(snr)  # Make SNR negative to increase noise
+            noise_scale = 10 ** (snr / 20.0)  # Convert to amplitude ratio
+            
+            # Ensure minimum noise level
+            noise_scale = max(noise_scale, 0.3)  # At least 30% noise
+            
+            # Mix signals
+            mixed = audio + (noise * noise_scale)
+            
+            # Print debug info
+            print(f"SNR: {snr:.1f} dB")
+            print(f"Noise scale: {noise_scale:.3f}")
+            print(f"Mixed range: {torch.min(mixed).item():.3f} to {torch.max(mixed).item():.3f}")
+            
+            # Final normalization
+            mixed = mixed / (torch.max(torch.abs(mixed)) + 1e-8) * 0.95
+            
+            return mixed
+            
+        except Exception as e:
+            print(f"Error adding noise: {str(e)}")
+            return audio
+
     def process_file(self, input_path, output_path):
         try:
-            # Select random noise file
+            # Load audio without explicit backend setting
+            audio, sr = torchaudio.load(input_path)
+            
+            # Select random noise and SNR
             noise_file = np.random.choice(self.noise_files)
-            noise_path = noise_file['wav']
+            snr = np.random.uniform(self.snr_low, self.snr_high)
             
-            # Get SNR from config
-            noise_config = self.config['TimeDomain']['AddNoise']
-            snr = np.random.uniform(noise_config['snr_low'], noise_config['snr_high'])
+            # Apply noise augmentation
+            augmented = self.add_noise(audio, noise_file, snr)
             
-            # Add noise
-            augmented, sr = self.add_noise(input_path, noise_path, snr)
-            
-            # Save with same parameters as input
+            # Save augmented audio
             torchaudio.save(output_path, augmented, sr)
             return True
-        
+            
         except Exception as e:
-            print(f"Error processing {input_path}: {e}")
+            print(f"\nError processing {input_path}: {e}")
             return False
 
 def main():

@@ -21,10 +21,13 @@ TimeDomain:
   #  amp_low: 0.5
   #  amp_high: 1.5
   AddNoise:
-    csv_file: ./noise.csv
+    csv_file: ./Extracted_Noise/noise.csv
     pad_noise: True
     snr_low: 5
-    snr_high: 15
+    snr_high: 10
+    noise_method: "spectral"  # Options: "repeat", "crossfade", "spectral"
+    segment_duration: 2.0  # seconds per noise segment
+    crossfade_duration: 0.1  # seconds for crossfade
   #AddReverb:
   #  csv_file: ./noise.csv
   #CutCat:
