@@ -5,20 +5,40 @@ import torchaudio
 import yaml
 import csv
 import math
+import librosa
 from tqdm import tqdm
 
 class AudioAugmenter:
     def __init__(self, config_path):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        # Load noise configuration
-        noise_config = self.config['TimeDomain']['AddNoise']
-        self.noise_csv = noise_config['csv_file']
-        self.snr_low = noise_config.get('snr_low', 0)
-        self.snr_high = noise_config.get('snr_high', 10)
-        self.noise_method = noise_config.get('noise_method', 'crossfade')  # Default to crossfade
     
+        # Load noise configuration
+        try:
+            noise_config = self.config['TimeDomain']['AddNoise']
+            self.noise_csv = noise_config['csv_file']
+            self.snr_low = noise_config.get('snr_low', 0)
+            self.snr_high = noise_config.get('snr_high', 10)
+            
+            # Explicitly get noise method from config
+            if 'noise_method' not in noise_config:
+                raise ValueError("noise_method not specified in config")
+            self.noise_method = noise_config['noise_method']
+            
+            # Display selected noise method
+            print(f"\nNoise Augmentation Configuration:")
+            print(f"Method: {self.noise_method}")
+            print(f"SNR range: {self.snr_low} to {self.snr_high} dB")
+            
+            # Validate noise method
+            valid_methods = ['spectral', 'crossfade', 'repeat']
+            if self.noise_method not in valid_methods:
+                raise ValueError(f"Invalid noise method: {self.noise_method}. Must be one of {valid_methods}")
+    
+        except KeyError as e:
+            print(f"Error reading config: {e}")
+            raise
+
         # Load noise files
         self.noise_files = []
         self.load_noise_files()
@@ -57,10 +77,19 @@ class AudioAugmenter:
         """Crossfade-based synthesis with smooth transitions"""
         # Get audio length and ensure noise matches
         audio_length = audio.shape[1]
+        
+        # Ensure noise has same number of channels as audio
+        if noise.shape[0] != audio.shape[0]:
+            noise = noise.repeat(audio.shape[0], 1)
+        
+        # Match noise length to audio length
         if noise.shape[1] != audio_length:
-            if noise.shape[1] < audio_length:
-                noise = noise.repeat(1, int(np.ceil(audio_length / noise.shape[1])))
-            noise = noise[:, :audio_length]
+            noise = torch.nn.functional.interpolate(
+                noise.unsqueeze(0),
+                size=audio_length,
+                mode='linear',
+                align_corners=False
+            ).squeeze(0)
     
         # Overlap parameters
         fade_duration = int(0.2 * sr)  # 200ms crossfade
@@ -69,12 +98,14 @@ class AudioAugmenter:
         envelope = torch.ones(audio_length)
         
         # Apply fade in
-        fade_in = torch.cos(torch.linspace(math.pi, 2*math.pi, fade_duration)) * 0.5 + 0.5
-        envelope[:fade_duration] = fade_in
-        
+        if fade_duration > 0:
+            fade_in = torch.cos(torch.linspace(math.pi, 2*math.pi, fade_duration)) * 0.5 + 0.5
+            envelope[:fade_duration] = fade_in
+    
         # Apply fade out
-        fade_out = torch.cos(torch.linspace(0, math.pi, fade_duration)) * 0.5 + 0.5
-        envelope[-fade_duration:] = fade_out
+        if fade_duration > 0:
+            fade_out = torch.cos(torch.linspace(0, math.pi, fade_duration)) * 0.5 + 0.5
+            envelope[-fade_duration:] = fade_out
         
         # Apply envelope to noise
         shaped_noise = noise * envelope.unsqueeze(0)
@@ -128,85 +159,107 @@ class AudioAugmenter:
 
     def add_noise(self, audio, sr):
         """Add multiple noise segments using specified synthesis method"""
+        print(f"\nApplying noise using {self.noise_method.upper()} synthesis")
+
         try:
             audio_length = audio.shape[1] / sr
             segments = get_dynamic_noise_segments(audio_length)
             mixed = audio.clone()
             noise_layer = torch.zeros_like(audio)
             noise_summary = []
-            
+
             for i, (start_sec, end_sec) in enumerate(segments):
-                start_sample = int(start_sec * sr)
-                end_sample = int(end_sec * sr)
-                
-                # Select random noise file and SNR
-                noise_file = np.random.choice(self.noise_files)
-                snr = np.random.uniform(self.snr_low, self.snr_high)
-                
-                # Load and prepare noise
-                noise, noise_sr = torchaudio.load(noise_file['wav'])
-                segment_length = end_sample - start_sample
-                
-                # Match noise length to segment
-                if noise.shape[1] < segment_length:
-                    repeats = int(np.ceil(segment_length / noise.shape[1]))
-                    noise = noise.repeat(1, repeats)[:, :segment_length]
-                else:
-                    noise = noise[:, :segment_length]
-                
-                # Normalize noise
-                noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
-                
-                # Apply selected synthesis method
-                if self.noise_method == "repeat":
-                    shaped_noise = self.apply_repeat_synthesis(audio[:, start_sample:end_sample], 
-                                                             noise, sr)
-                elif self.noise_method == "spectral":
-                    shaped_noise = self.apply_spectral_synthesis(audio[:, start_sample:end_sample].numpy()[0], 
-                                                               noise.numpy()[0], sr, snr)
-                    shaped_noise = torch.from_numpy(shaped_noise).unsqueeze(0)
-                else:  # default to crossfade
-                    shaped_noise = self.apply_crossfade_synthesis(audio[:, start_sample:end_sample], 
-                                                                noise, sr)
-                
-                # Calculate noise scale (except for spectral which handles SNR internally)
-                if self.noise_method != "spectral":
-                    snr = -abs(snr)
-                    noise_scale = 10 ** (snr / 20.0)
-                    noise_scale = max(noise_scale, 0.3)
-                    shaped_noise = shaped_noise * noise_scale
-                
-                # Add shaped noise to noise layer
-                noise_layer[:, start_sample:end_sample] += shaped_noise
-            
-                # Store noise info
-                noise_summary.append({
-                    'segment': i + 1,
-                    'noise_file': os.path.basename(noise_file['wav']),
-                    'start': f"{start_sec:.1f}s",
-                    'end': f"{end_sec:.1f}s",
-                    'duration': f"{end_sec - start_sec:.1f}s",
-                    'snr': f"{snr:.1f}dB",
-                    'method': self.noise_method
-                })
-            
-            # Normalize and mix
-            noise_layer = noise_layer / (torch.max(torch.abs(noise_layer)) + 1e-8)
-            mixed = mixed + (noise_layer * 0.7)
+                try:
+                    # Convert time to samples
+                    start_sample = int(start_sec * sr)
+                    end_sample = int(end_sec * sr)
+                    segment = audio[:, start_sample:end_sample]
+                    segment_length = segment.shape[1]
+                    
+                    # Select random noise and SNR
+                    noise_file = np.random.choice(self.noise_files)
+                    snr = np.random.uniform(self.snr_low, self.snr_high)
+                    
+                    # Load and prepare noise
+                    noise, noise_sr = torchaudio.load(noise_file['wav'])
+                    
+                    # Resample noise if needed
+                    if noise_sr != sr:
+                        noise = torchaudio.functional.resample(noise, noise_sr, sr)
+                    
+                    # Match noise length to segment length
+                    if noise.shape[1] < segment_length:
+                        repeats = int(np.ceil(segment_length / noise.shape[1]))
+                        noise = noise.repeat(1, repeats)[:, :segment_length]
+                    else:
+                        noise = noise[:, :segment_length]
+                    
+                    # Normalize noise
+                    noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
+                    
+                    # Apply synthesis method
+                    if self.noise_method == "spectral":
+                        shaped_noise = torch.from_numpy(
+                            self.apply_spectral_synthesis(
+                                segment.numpy()[0], 
+                                noise.numpy()[0], 
+                                sr, 
+                                snr
+                            )
+                        ).unsqueeze(0)
+                    elif self.noise_method == "repeat":
+                        shaped_noise = self.apply_repeat_synthesis(segment, noise, sr)
+                    else:
+                        shaped_noise = self.apply_crossfade_synthesis(segment, noise, sr)
+
+                    # Ensure shaped noise matches segment length
+                    if shaped_noise.shape[1] != segment_length:
+                        shaped_noise = torch.nn.functional.interpolate(
+                            shaped_noise.unsqueeze(0) if shaped_noise.dim() == 2 else shaped_noise,
+                            size=segment_length,
+                            mode='linear',
+                            align_corners=False
+                        ).squeeze(0)
+                        if shaped_noise.dim() == 1:
+                            shaped_noise = shaped_noise.unsqueeze(0)
+
+                    # Add shaped noise to layer
+                    noise_layer[:, start_sample:end_sample] = shaped_noise
+
+                    # Store noise info
+                    noise_summary.append({
+                        'segment': i + 1,
+                        'noise_file': os.path.basename(noise_file['wav']),
+                        'start': f"{start_sec:.1f}s",
+                        'end': f"{end_sec:.1f}s",
+                        'duration': f"{end_sec - start_sec:.1f}s",
+                        'snr': f"{snr:.1f}dB",
+                        'method': self.noise_method
+                    })
+
+                except Exception as e:
+                    print(f"Error processing segment {i+1}: {str(e)}")
+                    continue
+
+            # Mix and normalize
+            mixed = mixed + noise_layer
             mixed = mixed / (torch.max(torch.abs(mixed)) + 1e-8) * 0.95
-            
+
             # Print summary
-            print("\nNoise segments used:")
-            for segment in noise_summary:
-                print(f"Segment {segment['segment']}: {segment['noise_file']}")
-                print(f"  Duration: {segment['duration']} ({segment['start']} - {segment['end']})")
-                print(f"  SNR: {segment['snr']}")
-                print(f"  Method: {segment['method']}")
-        
+            if noise_summary:
+                print("\nNoise segments used:")
+                for segment in noise_summary:
+                    print(f"Segment {segment['segment']}: {segment['noise_file']}")
+                    print(f"  Duration: {segment['duration']} ({segment['start']} - {segment['end']})")
+                    print(f"  SNR: {segment['snr']}")
+                    print(f"  Method: {segment['method']}")
+
             return mixed
-        
+
         except Exception as e:
             print(f"Error adding noise: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return audio
 
     def process_file(self, input_path, output_path):
@@ -281,6 +334,12 @@ def main():
     parser.add_argument("-CONF_PTH", required=True)
     parser.add_argument("-OUT_PTH", required=True)
     args = parser.parse_args()
+    
+    # Verify config file exists
+    if not os.path.exists(args.CONF_PTH):
+        raise FileNotFoundError(f"Config file not found: {args.CONF_PTH}")
+    
+    print(f"Using config file: {args.CONF_PTH}")
     
     # Create output directory
     os.makedirs(args.OUT_PTH, exist_ok=True)

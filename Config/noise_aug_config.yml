@@ -2,8 +2,9 @@ TimeDomain:
   AddNoise:
     csv_file: ./Extracted_Noise/noise.csv
     pad_noise: True
-    snr_low: 10    # Adjust these values to control noise level
-    snr_high: 20   # Higher = more subtle noise
+    snr_low: 5
+    snr_high: 10
+    noise_method: "spectral"  # Options: "repeat", "crossfade", "spectral"
 
 Augmenter:
   parallel_augment: True
