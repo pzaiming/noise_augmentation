@@ -25,7 +25,7 @@ TimeDomain:
     pad_noise: True
     snr_low: 5
     snr_high: 10
-    noise_method: "spectral"  # Options: "repeat", "crossfade", "spectral"
+    noise_method: "crossfade"  # Options: "repeat", "crossfade", "spectral"
   #AddReverb:
   #  csv_file: ./noise.csv
   #CutCat:
