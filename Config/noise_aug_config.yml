@@ -4,7 +4,7 @@ TimeDomain:
     pad_noise: True
     snr_low: 5
     snr_high: 10
-    noise_method: "spectral"  # Options: "repeat", "crossfade", "spectral"
+    noise_method: "repeat"  # Options: "repeat", "crossfade", "spectral"
 
 Augmenter:
   parallel_augment: True

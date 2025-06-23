@@ -54,7 +54,7 @@ class AudioAugmenter:
             raise
 
     def apply_repeat_synthesis(self, audio, noise, sr):
-        """Simple repetition-based synthesis"""
+        """Simple repetition-based synthesis that loops the same noise"""
         # Convert to numpy for easier manipulation
         if torch.is_tensor(noise):
             noise = noise.numpy()[0]
@@ -63,12 +63,23 @@ class AudioAugmenter:
         else:
             audio_length = len(audio)
         
+        # Get base noise pattern
+        base_noise = noise
+        
         # Repeat noise to match audio length
-        if len(noise) < audio_length:
-            repeats = int(np.ceil(audio_length / len(noise)))
-            noise = np.tile(noise, repeats)[:audio_length]
+        if len(base_noise) < audio_length:
+            repeats = int(np.ceil(audio_length / len(base_noise)))
+            noise = np.tile(base_noise, repeats)[:audio_length]
         else:
-            noise = noise[:audio_length]
+            noise = base_noise[:audio_length]
+        
+        # Apply fade in/out to avoid clicks
+        fade_samples = int(0.01 * sr)  # 10ms fade
+        fade_in = np.linspace(0, 1, fade_samples)
+        fade_out = np.linspace(1, 0, fade_samples)
+        
+        noise[:fade_samples] *= fade_in
+        noise[-fade_samples:] *= fade_out
         
         # Convert back to torch tensor
         return torch.from_numpy(noise).unsqueeze(0)
@@ -158,108 +169,148 @@ class AudioAugmenter:
         return mixed
 
     def add_noise(self, audio, sr):
-        """Add multiple noise segments using specified synthesis method"""
+        """Add noise using specified synthesis method"""
         print(f"\nApplying noise using {self.noise_method.upper()} synthesis")
 
         try:
             audio_length = audio.shape[1] / sr
-            segments = get_dynamic_noise_segments(audio_length)
             mixed = audio.clone()
             noise_layer = torch.zeros_like(audio)
             noise_summary = []
 
-            for i, (start_sec, end_sec) in enumerate(segments):
+            # For repeat synthesis, use single noise segment
+            if self.noise_method == "repeat":
+                # Select single random noise file
+                noise_file = np.random.choice(self.noise_files)
+                snr = np.random.uniform(self.snr_low, self.snr_high)
+                
                 try:
-                    # Convert time to samples
-                    start_sample = int(start_sec * sr)
-                    end_sample = int(end_sec * sr)
-                    segment = audio[:, start_sample:end_sample]
-                    segment_length = segment.shape[1]
-                    
-                    # Select random noise and SNR
-                    noise_file = np.random.choice(self.noise_files)
-                    snr = np.random.uniform(self.snr_low, self.snr_high)
-                    
                     # Load and prepare noise
                     noise, noise_sr = torchaudio.load(noise_file['wav'])
                     
-                    # Resample noise if needed
-                    if noise_sr != sr:
-                        noise = torchaudio.functional.resample(noise, noise_sr, sr)
+                    # Apply repeat synthesis to entire audio
+                    shaped_noise = self.apply_repeat_synthesis(audio, noise, sr)
                     
-                    # Match noise length to segment length
-                    if noise.shape[1] < segment_length:
-                        repeats = int(np.ceil(segment_length / noise.shape[1]))
-                        noise = noise.repeat(1, repeats)[:, :segment_length]
-                    else:
-                        noise = noise[:, :segment_length]
+                    # Apply SNR scaling
+                    snr = -abs(snr)
+                    noise_scale = 10 ** (snr / 20.0)
+                    noise_scale = max(noise_scale, 0.3)
+                    shaped_noise = shaped_noise * noise_scale
                     
-                    # Normalize noise
-                    noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
+                    # Add to noise layer
+                    noise_layer = shaped_noise
                     
-                    # Apply synthesis method
-                    if self.noise_method == "spectral":
-                        shaped_noise = torch.from_numpy(
-                            self.apply_spectral_synthesis(
-                                segment.numpy()[0], 
-                                noise.numpy()[0], 
-                                sr, 
-                                snr
-                            )
-                        ).unsqueeze(0)
-                    elif self.noise_method == "repeat":
-                        shaped_noise = self.apply_repeat_synthesis(segment, noise, sr)
-                    else:
-                        shaped_noise = self.apply_crossfade_synthesis(segment, noise, sr)
-
-                    # Ensure shaped noise matches segment length
-                    if shaped_noise.shape[1] != segment_length:
-                        shaped_noise = torch.nn.functional.interpolate(
-                            shaped_noise.unsqueeze(0) if shaped_noise.dim() == 2 else shaped_noise,
-                            size=segment_length,
-                            mode='linear',
-                            align_corners=False
-                        ).squeeze(0)
-                        if shaped_noise.dim() == 1:
-                            shaped_noise = shaped_noise.unsqueeze(0)
-
-                    # Add shaped noise to layer
-                    noise_layer[:, start_sample:end_sample] = shaped_noise
-
-                    # Store noise info
+                    # Log noise info
                     noise_summary.append({
-                        'segment': i + 1,
+                        'segment': 1,
                         'noise_file': os.path.basename(noise_file['wav']),
-                        'start': f"{start_sec:.1f}s",
-                        'end': f"{end_sec:.1f}s",
-                        'duration': f"{end_sec - start_sec:.1f}s",
+                        'start': "0.0s",
+                        'end': f"{audio_length:.1f}s",
+                        'duration': f"{audio_length:.1f}s",
                         'snr': f"{snr:.1f}dB",
                         'method': self.noise_method
                     })
-
+                    
                 except Exception as e:
-                    print(f"Error processing segment {i+1}: {str(e)}")
-                    continue
+                    print(f"Error processing repeat synthesis: {str(e)}")
+                    return audio
+                
+            else:
+                # Original segmented processing for spectral and crossfade
+                segments = get_dynamic_noise_segments(audio_length)
+                mixed = audio.clone()
+                noise_layer = torch.zeros_like(audio)
+                noise_summary = []
+
+                for i, (start_sec, end_sec) in enumerate(segments):
+                    try:
+                        # Convert time to samples
+                        start_sample = int(start_sec * sr)
+                        end_sample = int(end_sec * sr)
+                        segment = audio[:, start_sample:end_sample]
+                        segment_length = segment.shape[1]
+                        
+                        # Select random noise and SNR
+                        noise_file = np.random.choice(self.noise_files)
+                        snr = np.random.uniform(self.snr_low, self.snr_high)
+                        
+                        # Load and prepare noise
+                        noise, noise_sr = torchaudio.load(noise_file['wav'])
+                        
+                        # Resample noise if needed
+                        if noise_sr != sr:
+                            noise = torchaudio.functional.resample(noise, noise_sr, sr)
+                        
+                        # Match noise length to segment length
+                        if noise.shape[1] < segment_length:
+                            repeats = int(np.ceil(segment_length / noise.shape[1]))
+                            noise = noise.repeat(1, repeats)[:, :segment_length]
+                        else:
+                            noise = noise[:, :segment_length]
+                        
+                        # Normalize noise
+                        noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
+                        
+                        # Apply synthesis method
+                        if self.noise_method == "spectral":
+                            shaped_noise = torch.from_numpy(
+                                self.apply_spectral_synthesis(
+                                    segment.numpy()[0], 
+                                    noise.numpy()[0], 
+                                    sr, 
+                                    snr
+                                )
+                            ).unsqueeze(0)
+                        elif self.noise_method == "repeat":
+                            shaped_noise = self.apply_repeat_synthesis(segment, noise, sr)
+                        else:
+                            shaped_noise = self.apply_crossfade_synthesis(segment, noise, sr)
+
+                        # Ensure shaped noise matches segment length
+                        if shaped_noise.shape[1] != segment_length:
+                            shaped_noise = torch.nn.functional.interpolate(
+                                shaped_noise.unsqueeze(0) if shaped_noise.dim() == 2 else shaped_noise,
+                                size=segment_length,
+                                mode='linear',
+                                align_corners=False
+                            ).squeeze(0)
+                            if shaped_noise.dim() == 1:
+                                shaped_noise = shaped_noise.unsqueeze(0)
+
+                        # Add shaped noise to layer
+                        noise_layer[:, start_sample:end_sample] = shaped_noise
+
+                        # Store noise info
+                        noise_summary.append({
+                            'segment': i + 1,
+                            'noise_file': os.path.basename(noise_file['wav']),
+                            'start': f"{start_sec:.1f}s",
+                            'end': f"{end_sec:.1f}s",
+                            'duration': f"{end_sec - start_sec:.1f}s",
+                            'snr': f"{snr:.1f}dB",
+                            'method': self.noise_method
+                        })
+
+                    except Exception as e:
+                        print(f"Error processing segment {i+1}: {str(e)}")
+                        continue
 
             # Mix and normalize
             mixed = mixed + noise_layer
             mixed = mixed / (torch.max(torch.abs(mixed)) + 1e-8) * 0.95
 
             # Print summary
-            if noise_summary:
-                print("\nNoise segments used:")
-                for segment in noise_summary:
-                    print(f"Segment {segment['segment']}: {segment['noise_file']}")
-                    print(f"  Duration: {segment['duration']} ({segment['start']} - {segment['end']})")
-                    print(f"  SNR: {segment['snr']}")
-                    print(f"  Method: {segment['method']}")
+            print("\nNoise segments used:")
+            for segment in noise_summary:
+                print(f"Segment {segment['segment']}: {segment['noise_file']}")
+                print(f"  Duration: {segment['duration']} ({segment['start']} - {segment['end']})")
+                print(f"  SNR: {segment['snr']}")
+                print(f"  Method: {segment['method']}")
 
             return mixed
 
         except Exception as e:
             print(f"Error adding noise: {str(e)}")
-            import traceback
-            traceback.print_exc()
             return audio
 
     def process_file(self, input_path, output_path):
@@ -286,36 +337,23 @@ class AudioAugmenter:
 
 def get_dynamic_noise_segments(audio_length):
     """
-    Calculate noise segments based on audio length:
-    - For clips <= 5s: single noise
-    - For clips > 5s: 2-3 segments
-    
-    Parameters:
-    - audio_length: Length of the audio in seconds
-    
-    Returns: List of (start_time, end_time) tuples
+    For repeat synthesis, use one long segment
     """
-    segments = []
-    
-    # For very short clips (<= 5s), use single noise
     if audio_length <= 5.0:
-        segments.append((0.0, audio_length))
-        return segments
-    
-    # For longer clips, use 2-3 segments
-    num_segments = np.random.randint(2, 4)  # 2 or 3 segments
-    
-    # Create random split points
-    split_points = [0.0]  # Start point
-    random_splits = sorted(np.random.uniform(0.2, 0.8, num_segments-1))
-    split_points.extend(random_splits)
-    split_points.append(1.0)  # End point
-    
-    # Convert split points to actual time segments
-    for i in range(len(split_points)-1):
-        start = split_points[i] * audio_length
-        end = split_points[i+1] * audio_length
-        segments.append((start, end))
+        segments = [(0.0, audio_length)]
+    else:
+        # For longer audio, use 2-3 segments
+        num_segments = np.random.randint(2, 4)
+        split_points = [0.0]
+        random_splits = sorted(np.random.uniform(0.2, 0.8, num_segments-1))
+        split_points.extend(random_splits)
+        split_points.append(1.0)
+        
+        segments = []
+        for i in range(len(split_points)-1):
+            start = split_points[i] * audio_length
+            end = split_points[i+1] * audio_length
+            segments.append((start, end))
     
     return segments
 
