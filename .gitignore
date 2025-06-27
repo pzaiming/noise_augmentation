@@ -36,4 +36,5 @@ temp_noise_augment/
 
 # Project specific
 AUG_AUDIO/
+Audio/TRAIN/
 EOF
