@@ -2,8 +2,8 @@ TimeDomain:
   AddNoise:
     csv_file: ./Extracted_Noise/noise.csv
     pad_noise: True
-    snr_low: 5
-    snr_high: 10
+    snr_low: -3
+    snr_high: 3
     noise_method: "crossfade"  # Options: "repeat", "crossfade", "spectral"
 
 Augmenter:

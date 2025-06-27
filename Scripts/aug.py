@@ -7,6 +7,7 @@ import csv
 import math
 import librosa
 from tqdm import tqdm
+import random
 
 class AudioAugmenter:
     def __init__(self, config_path):
@@ -174,120 +175,149 @@ class AudioAugmenter:
             print(f"Error in spectral synthesis: {str(e)}")
             return speech
 
-    def format_time(self, seconds):
-        """Convert seconds to minutes and seconds format"""
-        minutes = int(seconds // 60)
-        remaining_seconds = seconds % 60
-        if minutes > 0:
-            return f"{minutes}m {remaining_seconds:.1f}s"
-        return f"{remaining_seconds:.1f}s"
-
     def add_noise(self, audio, sr):
-        """Add multiple noise segments using specified synthesis method"""
+        """Add noise using specified synthesis method"""
+        print(f"\nApplying noise using {self.noise_method.upper()} synthesis")
+
         try:
             audio_length = audio.shape[1] / sr
-            print(f"\nAudio length: {self.format_time(audio_length)}")
-            print(f"\nApplying noise using {self.noise_method.upper()} synthesis")
-
-            segments = get_dynamic_noise_segments(audio_length)
             mixed = audio.clone()
             noise_layer = torch.zeros_like(audio)
             noise_summary = []
 
-            for i, (start_sec, end_sec) in enumerate(segments):
+            # For repeat synthesis, use single noise segment
+            if self.noise_method == "repeat":
+                # Select single random noise file
+                noise_file = np.random.choice(self.noise_files)
+                snr = np.random.uniform(self.snr_low, self.snr_high)
+                
                 try:
-                    # Convert time to samples
-                    start_sample = int(start_sec * sr)
-                    end_sample = int(end_sec * sr)
-                    segment = audio[:, start_sample:end_sample]
-                    
-                    # Select random noise and SNR
-                    noise_file = np.random.choice(self.noise_files)
-                    snr = np.random.uniform(self.snr_low, self.snr_high)
-                    
                     # Load and prepare noise
                     noise, noise_sr = torchaudio.load(noise_file['wav'])
                     
-                    # Resample noise if needed
-                    if noise_sr != sr:
-                        noise = torchaudio.functional.resample(noise, noise_sr, sr)
+                    # Apply repeat synthesis to entire audio
+                    shaped_noise = self.apply_repeat_synthesis(audio, noise, sr)
                     
-                    # Match noise length to segment length
-                    segment_length = segment.shape[1]
-                    if noise.shape[1] != segment_length:
-                        noise = torch.nn.functional.interpolate(
-                            noise.unsqueeze(0),
-                            size=segment_length,
-                            mode='linear',
-                            align_corners=False
-                        ).squeeze(0)
-
-                    # Apply synthesis based on method
-                    if self.noise_method == "spectral":
-                        shaped_noise = self.apply_spectral_synthesis(
-                            segment.numpy()[0],
-                            noise.numpy()[0],
-                            sr,
-                            snr
-                        )
-                        shaped_noise = torch.from_numpy(shaped_noise).unsqueeze(0)
-                    elif self.noise_method == "repeat":
-                        shaped_noise = self.apply_repeat_synthesis(segment, noise, sr)
-                        # Apply SNR scaling
-                        snr_factor = 10 ** (-snr / 20)
-                        shaped_noise = shaped_noise * snr_factor
-                    else:  # crossfade
-                        shaped_noise = self.apply_crossfade_synthesis(segment, noise, sr)
-                        # Apply SNR scaling
-                        snr_factor = 10 ** (-snr / 20)
-                        shaped_noise = shaped_noise * snr_factor
-
-                    # Add shaped noise to layer
-                    noise_layer[:, start_sample:end_sample] = shaped_noise
-
-                    # Add debug info
-                    print(f"\nDebug - Segment {i+1}:")
-                    print(f"Max speech amplitude: {torch.max(torch.abs(segment)):.6f}")
-                    print(f"Max noise amplitude: {torch.max(torch.abs(shaped_noise)):.6f}")
-                    print(f"SNR factor: {snr_factor if self.noise_method != 'spectral' else 'N/A'}")
-
-                    # Store segment info
+                    # Apply SNR scaling
+                    snr = -abs(snr)
+                    noise_scale = 10 ** (snr / 20.0)
+                    noise_scale = max(noise_scale, 0.3)
+                    shaped_noise = shaped_noise * noise_scale
+                    
+                    # Add to noise layer
+                    noise_layer = shaped_noise
+                    
+                    # Log noise info
                     noise_summary.append({
-                        'segment': i + 1,
+                        'segment': 1,
                         'noise_file': os.path.basename(noise_file['wav']),
-                        'start': start_sec,
-                        'end': end_sec,
-                        'duration': end_sec - start_sec,
-                        'snr': snr,
+                        'start': "0.0s",
+                        'end': f"{audio_length:.1f}s",
+                        'duration': f"{audio_length:.1f}s",
+                        'snr': f"{snr:.1f}dB",
                         'method': self.noise_method
                     })
-
+                    
                 except Exception as e:
-                    print(f"Error processing segment {i+1}: {str(e)}")
-                    continue
+                    print(f"Error processing repeat synthesis: {str(e)}")
+                    return audio
+                
+            else:
+                # Original segmented processing for spectral and crossfade
+                segments = get_dynamic_noise_segments(audio_length)
+                mixed = audio.clone()
+                noise_layer = torch.zeros_like(audio)
+                noise_summary = []
 
-            # Mix audio with noise
-            mixed = mixed + noise_layer * 0.7  # Adjust noise level
+                for i, (start_sec, end_sec) in enumerate(segments):
+                    try:
+                        # Convert time to samples
+                        start_sample = int(start_sec * sr)
+                        end_sample = int(end_sec * sr)
+                        segment = audio[:, start_sample:end_sample]
+                        segment_length = segment.shape[1]
+                        
+                        # Select random noise and SNR
+                        noise_file = np.random.choice(self.noise_files)
+                        snr = np.random.uniform(self.snr_low, self.snr_high)
+                        
+                        # Load and prepare noise
+                        noise, noise_sr = torchaudio.load(noise_file['wav'])
+                        
+                        # Resample noise if needed
+                        if noise_sr != sr:
+                            noise = torchaudio.functional.resample(noise, noise_sr, sr)
+                        
+                        # Match noise length to segment length
+                        if noise.shape[1] < segment_length:
+                            repeats = int(np.ceil(segment_length / noise.shape[1]))
+                            noise = noise.repeat(1, repeats)[:, :segment_length]
+                        else:
+                            noise = noise[:, :segment_length]
+                        
+                        # Normalize noise
+                        noise = noise / (torch.max(torch.abs(noise)) + 1e-8)
+                        
+                        # Apply synthesis method
+                        if self.noise_method == "spectral":
+                            shaped_noise = torch.from_numpy(
+                                self.apply_spectral_synthesis(
+                                    segment.numpy()[0], 
+                                    noise.numpy()[0], 
+                                    sr, 
+                                    snr
+                                )
+                            ).unsqueeze(0)
+                        elif self.noise_method == "repeat":
+                            shaped_noise = self.apply_repeat_synthesis(segment, noise, sr)
+                        else:
+                            shaped_noise = self.apply_crossfade_synthesis(segment, noise, sr)
 
-            # Normalize final output
-            max_val = torch.max(torch.abs(mixed))
-            mixed = mixed / max_val * 0.95
+                        # Ensure shaped noise matches segment length
+                        if shaped_noise.shape[1] != segment_length:
+                            shaped_noise = torch.nn.functional.interpolate(
+                                shaped_noise.unsqueeze(0) if shaped_noise.dim() == 2 else shaped_noise,
+                                size=segment_length,
+                                mode='linear',
+                                align_corners=False
+                            ).squeeze(0)
+                            if shaped_noise.dim() == 1:
+                                shaped_noise = shaped_noise.unsqueeze(0)
+
+                        # Add shaped noise to layer
+                        noise_layer[:, start_sample:end_sample] = shaped_noise
+
+                        # Store noise info
+                        noise_summary.append({
+                            'segment': i + 1,
+                            'noise_file': os.path.basename(noise_file['wav']),
+                            'start': f"{start_sec:.1f}s",
+                            'end': f"{end_sec:.1f}s",
+                            'duration': f"{end_sec - start_sec:.1f}s",
+                            'snr': f"{snr:.1f}dB",
+                            'method': self.noise_method
+                        })
+
+                    except Exception as e:
+                        print(f"Error processing segment {i+1}: {str(e)}")
+                        continue
+
+            # Mix and normalize
+            mixed = mixed + noise_layer
+            mixed = mixed / (torch.max(torch.abs(mixed)) + 1e-8) * 0.95
 
             # Print summary
             print("\nNoise segments used:")
-            for seg in noise_summary:
-                print(f"Segment {seg['segment']}: {seg['noise_file']}")
-                print(f"  Duration: {self.format_time(seg['duration'])} "
-                    f"({self.format_time(seg['start'])} - {self.format_time(seg['end'])})")
-                print(f"  SNR: {seg['snr']:.1f}dB")
-                print(f"  Method: {seg['method']}")
+            for segment in noise_summary:
+                print(f"Segment {segment['segment']}: {segment['noise_file']}")
+                print(f"  Duration: {segment['duration']} ({segment['start']} - {segment['end']})")
+                print(f"  SNR: {segment['snr']}")
+                print(f"  Method: {segment['method']}")
 
             return mixed
 
         except Exception as e:
             print(f"Error adding noise: {str(e)}")
-            import traceback
-            traceback.print_exc()
             return audio
 
     def process_file(self, input_path, output_path):
@@ -314,149 +344,91 @@ class AudioAugmenter:
 
 def get_dynamic_noise_segments(audio_length):
     """
-    Systematic approach for noise segmentation:
-    
-    1. Short clips (< 1 min):
-       - Single noise segment
-    
-    2. Medium clips (1-5 mins):
-       - 2 segments with golden ratio split
-       - Prevents repetition
-    
-    3. Long clips (5-15 mins):
-       - 3-4 segments
-       - Min segment length: 2 mins
-       - Max segment length: 5 mins
-    
-    4. Extended clips (> 15 mins):
-       - 1 segment per 4-6 mins
-       - Random variation in lengths
-       - No consecutive repetition
+    Calculate dynamic noise segments based on audio length
+    - For long audio (>10 mins): 1 segment per ~5-8 minutes
+    - Randomized segment lengths
+    - Natural transitions
     """
     segments = []
     
-    # Constants for segment calculation
-    GOLDEN_RATIO = 0.618
-    MIN_SEGMENT = 120  # 2 mins minimum
-    MAX_SEGMENT = 300  # 5 mins maximum
+    # Calculate number of segments based on length
+    if audio_length <= 300:  # <= 5 minutes
+        num_segments = np.random.randint(2, 4)
+    else:
+        # 1 segment per 5-8 minutes (randomized)
+        mins_per_segment = np.random.uniform(5 * 60, 8 * 60)
+        num_segments = max(3, int(np.ceil(audio_length / mins_per_segment)))
     
-    if audio_length < 60:  # Short clips
-        segments = [(0.0, audio_length)]
+    # Create split points with variability
+    split_points = [0.0]
+    remaining_length = audio_length
+    
+    for i in range(num_segments - 1):
+        # Calculate min and max lengths for this segment
+        min_length = min(300, remaining_length * 0.15)  # At least 15% or 5 mins
+        max_length = min(480, remaining_length * 0.3)   # At most 30% or 8 mins
         
-    elif audio_length <= 300:  # Medium clips (1-5 mins)
-        # Use golden ratio for natural-feeling split
-        split_point = audio_length * GOLDEN_RATIO
-        segments = [
-            (0.0, split_point),
-            (split_point, audio_length)
-        ]
-        
-    elif audio_length <= 900:  # Long clips (5-15 mins)
-        num_segments = np.random.randint(3, 5)
-        remaining_length = audio_length
-        current_point = 0.0
-        
-        while remaining_length > 0 and len(segments) < num_segments:
-            # Calculate segment length
-            min_len = min(MIN_SEGMENT, remaining_length * 0.2)
-            max_len = min(MAX_SEGMENT, remaining_length * 0.4)
-            segment_length = np.random.uniform(min_len, max_len)
-            
-            segments.append((current_point, current_point + segment_length))
-            current_point += segment_length
-            remaining_length -= segment_length
-            
-        # Add final segment if needed
-        if remaining_length > 0:
-            segments.append((current_point, audio_length))
-            
-    else:  # Extended clips (> 15 mins)
-        # Calculate number of segments (1 per 4-6 minutes)
-        segment_duration = np.random.uniform(240, 360)
-        num_segments = max(4, int(np.ceil(audio_length / segment_duration)))
-        remaining_length = audio_length
-        current_point = 0.0
-        
-        for i in range(num_segments - 1):
-            # Vary segment length by ±20%
-            base_length = remaining_length / (num_segments - i)
-            variation = base_length * 0.2
-            segment_length = np.random.uniform(
-                base_length - variation,
-                base_length + variation
-            )
-            
-            segments.append((current_point, current_point + segment_length))
-            current_point += segment_length
-            remaining_length -= segment_length
-        
-        # Add final segment
-        segments.append((current_point, audio_length))
+        # Add some randomness to segment length
+        segment_length = np.random.uniform(min_length, max_length)
+        split_points.append(split_points[-1] + segment_length)
+        remaining_length -= segment_length
+    
+    split_points.append(audio_length)
+    
+    # Convert to segments
+    segments = [(split_points[i], split_points[i+1]) for i in range(len(split_points)-1)]
     
     return segments
 
-def select_noise_files(self, num_segments):
-    """
-    Select noise files ensuring no consecutive repetition
-    """
-    selected_files = []
-    available_files = self.noise_files.copy()
-    
-    for i in range(num_segments):
-        if not available_files:
-            # Reset pool but exclude recently used files
-            available_files = [n for n in self.noise_files 
-                             if n not in selected_files[-2:]]
-        
-        # Select random file
-        noise_file = np.random.choice(available_files)
-        available_files.remove(noise_file)
-        selected_files.append(noise_file)
-    
-    return selected_files
+def get_noise_segment(noise_file, segment_length, used_segments, total_length):
+    max_start = total_length - segment_length
+    attempts = 0
+    while attempts < 10:
+        start = random.randint(0, max_start)
+        end = start + segment_length
+        if not any(us <= start < ue or us < end <= ue for us, ue in used_segments):
+            used_segments.append((start, end))
+            return start, end
+        attempts += 1
+    return None  # fallback if too many overlaps
+
+# Example usage:
+examples = [3.0, 4.5, 6.0, 8.0]
+for length in examples:
+    segments = get_dynamic_noise_segments(length)
+    print(f"\n{length}s audio segments:")
+    print(f"Number of segments: {len(segments)}")
+    print(f"Segments: {segments}")
 
 def main():
     import argparse
-    from tqdm import tqdm
-    
-    # Parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("-AUD_PTH", required=True)
     parser.add_argument("-CONF_PTH", required=True)
     parser.add_argument("-OUT_PTH", required=True)
     args = parser.parse_args()
     
+    # Verify config file exists
+    if not os.path.exists(args.CONF_PTH):
+        raise FileNotFoundError(f"Config file not found: {args.CONF_PTH}")
+    
+    print(f"Using config file: {args.CONF_PTH}")
+    
     # Create output directory
     os.makedirs(args.OUT_PTH, exist_ok=True)
     
     # Initialize augmenter
-    print("Initializing augmenter...")
     augmenter = AudioAugmenter(args.CONF_PTH)
     
-    # Get list of audio files
-    audio_files = [f for f in os.listdir(args.AUD_PTH) if f.endswith('.mp3') or f.endswith('.wav')]
+    # Get audio files
+    audio_files = [f for f in os.listdir(args.AUD_PTH) 
+                   if f.endswith(('.wav', '.mp3', '.flac'))]
     
-    # Process each file with progress bar
-    for audio_file in tqdm(audio_files, desc="Processing audio files"):
-        print("\nProcessing:", audio_file)
-        print("-" * 50)
-        
-        input_path = os.path.join(args.AUD_PTH, audio_file)
-        output_path = os.path.join(args.OUT_PTH, f"aug_{audio_file}")
-        
-        try:
-            # Load audio
-            audio, sr = torchaudio.load(input_path)
-            
-            # Apply augmentation
-            augmented = augmenter.add_noise(audio, sr)
-            
-            # Save augmented audio
-            torchaudio.save(output_path, augmented, sr)
-            
-        except Exception as e:
-            print(f"Error processing {audio_file}: {str(e)}")
-            continue
+    # Process files
+    for file in tqdm(audio_files):
+        input_path = os.path.join(args.AUD_PTH, file)
+        output_path = os.path.join(args.OUT_PTH, f"aug_{file}")
+        augmenter.process_file(input_path, output_path)
 
 if __name__ == "__main__":
     main()
