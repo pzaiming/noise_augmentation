@@ -125,48 +125,54 @@ class AudioAugmenter:
 
     def apply_spectral_synthesis(self, speech, noise, sr, snr):
         """
-        Blend speech and noise in spectral domain
+        Blend speech and noise in spectral domain using STFT
         
         Args:
-            speech: Speech waveform
-            noise: Noise waveform
+            speech: Speech waveform (numpy array)
+            noise: Noise waveform (numpy array)
             sr: Sample rate
             snr: Signal-to-noise ratio in dB
         """
-        # STFT parameters
-        n_fft = 2048
-        hop_length = n_fft // 4
-        win_length = n_fft
-        
-        # Convert to spectrograms
-        speech_stft = librosa.stft(speech, n_fft=n_fft, 
-                                  hop_length=hop_length,
-                                  win_length=win_length)
-        noise_stft = librosa.stft(noise, n_fft=n_fft,
-                                 hop_length=hop_length,
-                                 win_length=win_length)
-        
-        # Get magnitudes and phases
-        speech_mag = np.abs(speech_stft)
-        speech_phase = np.angle(speech_stft)
-        noise_mag = np.abs(noise_stft)
-        noise_phase = np.angle(noise_stft)
-        
-        # Calculate noise scale based on SNR
-        speech_power = np.mean(speech_mag ** 2)
-        noise_power = np.mean(noise_mag ** 2)
-        noise_scale = np.sqrt(speech_power / (noise_power * 10 ** (snr / 10)))
-        
-        # Blend magnitudes
-        mixed_mag = speech_mag + (noise_mag * noise_scale)
-        
-        # Combine with original speech phase
-        mixed_stft = mixed_mag * np.exp(1j * speech_phase)
-        
-        # Convert back to time domain
-        mixed = librosa.istft(mixed_stft, hop_length=hop_length, win_length=win_length)
-        
-        return mixed
+        try:
+            # STFT parameters
+            n_fft = 2048
+            hop_length = n_fft // 4
+            win_length = n_fft
+            
+            # Convert to spectrograms
+            speech_stft = librosa.stft(speech, n_fft=n_fft, 
+                                     hop_length=hop_length,
+                                     win_length=win_length)
+            noise_stft = librosa.stft(noise, n_fft=n_fft,
+                                    hop_length=hop_length,
+                                    win_length=win_length)
+            
+            # Get magnitudes and phases
+            speech_mag = np.abs(speech_stft)
+            speech_phase = np.angle(speech_stft)
+            noise_mag = np.abs(noise_stft)
+            noise_phase = np.angle(noise_stft)
+            
+            # Calculate noise scale based on SNR
+            speech_power = np.mean(speech_mag ** 2)
+            noise_power = np.mean(noise_mag ** 2)
+            noise_scale = np.sqrt(speech_power / (noise_power * 10 ** (-snr / 10)))  # Note the negative SNR
+            
+            # Mix magnitudes while preserving speech phase
+            mixed_mag = speech_mag + (noise_mag * noise_scale)
+            mixed_stft = mixed_mag * np.exp(1j * speech_phase)
+            
+            # Convert back to time domain
+            mixed = librosa.istft(mixed_stft, 
+                                hop_length=hop_length,
+                                win_length=win_length,
+                                length=len(speech))  # Preserve original length
+            
+            return mixed
+            
+        except Exception as e:
+            print(f"Error in spectral synthesis: {str(e)}")
+            return speech
 
     def add_noise(self, audio, sr):
         """Add noise using specified synthesis method"""
@@ -337,23 +343,39 @@ class AudioAugmenter:
 
 def get_dynamic_noise_segments(audio_length):
     """
-    For repeat synthesis, use one long segment
+    Calculate dynamic noise segments based on audio length
+    - For long audio (>10 mins): 1 segment per ~5-8 minutes
+    - Randomized segment lengths
+    - Natural transitions
     """
-    if audio_length <= 5.0:
-        segments = [(0.0, audio_length)]
-    else:
-        # For longer audio, use 2-3 segments
+    segments = []
+    
+    # Calculate number of segments based on length
+    if audio_length <= 300:  # <= 5 minutes
         num_segments = np.random.randint(2, 4)
-        split_points = [0.0]
-        random_splits = sorted(np.random.uniform(0.2, 0.8, num_segments-1))
-        split_points.extend(random_splits)
-        split_points.append(1.0)
+    else:
+        # 1 segment per 5-8 minutes (randomized)
+        mins_per_segment = np.random.uniform(5 * 60, 8 * 60)
+        num_segments = max(3, int(np.ceil(audio_length / mins_per_segment)))
+    
+    # Create split points with variability
+    split_points = [0.0]
+    remaining_length = audio_length
+    
+    for i in range(num_segments - 1):
+        # Calculate min and max lengths for this segment
+        min_length = min(300, remaining_length * 0.15)  # At least 15% or 5 mins
+        max_length = min(480, remaining_length * 0.3)   # At most 30% or 8 mins
         
-        segments = []
-        for i in range(len(split_points)-1):
-            start = split_points[i] * audio_length
-            end = split_points[i+1] * audio_length
-            segments.append((start, end))
+        # Add some randomness to segment length
+        segment_length = np.random.uniform(min_length, max_length)
+        split_points.append(split_points[-1] + segment_length)
+        remaining_length -= segment_length
+    
+    split_points.append(audio_length)
+    
+    # Convert to segments
+    segments = [(split_points[i], split_points[i+1]) for i in range(len(split_points)-1)]
     
     return segments
 
